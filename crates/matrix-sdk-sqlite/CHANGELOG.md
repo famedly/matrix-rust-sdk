@@ -4,6 +4,24 @@ All notable changes to this project will be documented in this file.
 
 <!-- changelog start -->
 
+## Unreleased
+
+### Features
+
+- Add support for the `wasm32-unknown-unknown` target. On WASM the stores use a
+  single `rusqlite` connection backed by the OPFS `sahpool` VFS instead of a
+  `deadpool` connection pool. The stores must be created and used from a single
+  dedicated Web Worker, and opening the same stores from several tabs or
+  workers concurrently is not supported; see the `SqliteStoreConfig`
+  documentation for details.
+
+### Refactor
+
+- Upgrade `rusqlite` from 0.37 to 0.39, which provides the SQLite WASM backend.
+  Native builds now link `libsqlite3-sys` 0.37; when linking against a system
+  SQLite (i.e. without the `bundled` feature), the minimum supported SQLite
+  version may change accordingly.
+
 ## [0.18.0](https://github.com/matrix-org/matrix-rust-sdk/tree/0.18.0) - 2026-06-02
 
 No significant changes.

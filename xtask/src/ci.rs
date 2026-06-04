@@ -163,6 +163,10 @@ enum WasmFeatureSet {
     /// Equivalent to `indexeddb-all-features`, `indexeddb-crypto` and
     /// `indexeddb-state`
     Indexeddb,
+    /// Check `matrix-sdk-sqlite` crate with all features
+    SqliteAllFeatures,
+    /// Check `matrix-sdk` crate with `sqlite` and `e2e-encryption` features
+    MatrixSdkSqliteStores,
 }
 
 impl CiArgs {
@@ -389,6 +393,11 @@ fn run_wasm_checks(cmd: Option<WasmFeatureSet>) -> Result<()> {
             WasmFeatureSet::IndexeddbState,
             "-p matrix-sdk-indexeddb --no-default-features --features state-store",
         ),
+        (WasmFeatureSet::SqliteAllFeatures, "-p matrix-sdk-sqlite --all-features"),
+        (
+            WasmFeatureSet::MatrixSdkSqliteStores,
+            "-p matrix-sdk --no-default-features --features js,sqlite,e2e-encryption",
+        ),
     ]);
 
     let sh = sh();
@@ -450,6 +459,10 @@ fn run_wasm_pack_tests(cmd: Option<WasmFeatureSet>, runner: WasmTestRunner) -> R
             WasmFeatureSet::IndexeddbState,
             ("crates/matrix-sdk-indexeddb", "--no-default-features --features state-store"),
         ),
+        // The sqlite smoke tests require OPFS and a dedicated worker, so they
+        // only run in browser runners (`--runner chrome` or `--runner
+        // firefox`), not on Node.js.
+        (WasmFeatureSet::SqliteAllFeatures, ("crates/matrix-sdk-sqlite", "")),
     ]);
 
     let sh = sh();

@@ -14,13 +14,12 @@
 
 //! An SQLite-based backend for the [`MediaStore`].
 
-use std::{
-    fmt,
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+#[cfg(not(target_family = "wasm"))]
+use std::path::PathBuf;
+use std::{fmt, path::Path, sync::Arc};
 
 use async_trait::async_trait;
+#[cfg(not(target_family = "wasm"))]
 use deadpool::managed::PoolConfig;
 use matrix_sdk_base::{
     cross_process_lock::CrossProcessLockGeneration,
@@ -36,15 +35,14 @@ use matrix_sdk_base::{
 use matrix_sdk_store_encryption::StoreCipher;
 use ruma::{MilliSecondsSinceUnixEpoch, MxcUri, time::SystemTime};
 use rusqlite::{OptionalExtension, params_from_iter};
-use tokio::{
-    fs,
-    sync::{Mutex, OwnedMutexGuard},
-};
+#[cfg(not(target_family = "wasm"))]
+use tokio::fs;
+use tokio::sync::{Mutex, OwnedMutexGuard};
 use tracing::{debug, instrument};
 
 use crate::{
     OpenStoreError, RuntimeConfig, Secret, SqliteStoreConfig,
-    connection::{self, Connection as SqliteAsyncConn, Pool as SqlitePool, SqliteConnections},
+    connection::{self, Connection as SqliteAsyncConn, SqliteConnections},
     error::{Error, Result},
     utils::{
         EncryptableStore, SqliteAsyncConnExt, SqliteKeyValueStoreAsyncConnExt,
@@ -72,9 +70,15 @@ pub struct SqliteMediaStore {
     /// `Some` when active, `None` when closed.
     connections: Arc<Mutex<Option<SqliteConnections>>>,
 
+    #[cfg(not(target_family = "wasm"))]
     /// Retained so we can rebuild the pool on reopen.
     db_path: PathBuf,
 
+    #[cfg(target_family = "wasm")]
+    /// Retained so we can rebuild the connection on reopen.
+    db_name: String,
+
+    #[cfg(not(target_family = "wasm"))]
     /// Retained so we can rebuild the pool on reopen.
     pool_config: PoolConfig,
 
@@ -116,6 +120,7 @@ impl SqliteMediaStore {
         Self::open_with_config(&SqliteStoreConfig::new(path).key(key)).await
     }
 
+    #[cfg(not(target_family = "wasm"))]
     /// Open the SQLite-based media store with the config open config.
     #[instrument(skip(config), fields(path = ?config.path))]
     pub async fn open_with_config(config: &SqliteStoreConfig) -> Result<Self, OpenStoreError> {
@@ -141,10 +146,27 @@ impl SqliteMediaStore {
         Ok(this)
     }
 
+    #[cfg(target_family = "wasm")]
+    /// Open the SQLite-based media store with the config open config.
+    pub async fn open_with_config(config: &SqliteStoreConfig) -> Result<Self, OpenStoreError> {
+        let runtime_config = config.runtime_config();
+        let conn = config.build_wasm_connection(DATABASE_NAME).await?;
+        let db_name = format!("{}-{}", config.db_name, DATABASE_NAME);
+
+        let this = Self::open_with_connection(conn, config.secret.clone(), db_name, runtime_config)
+            .await?;
+
+        // Apply runtime config on the write connection.
+        this.write().await?.apply_runtime_config(runtime_config).await?;
+
+        Ok(this)
+    }
+
+    #[cfg(not(target_family = "wasm"))]
     /// Open an SQLite-based media store using the given SQLite database
     /// pool. The given passphrase will be used to encrypt private data.
     async fn open_with_pool(
-        pool: SqlitePool,
+        pool: connection::Pool,
         db_path: PathBuf,
         pool_config: PoolConfig,
         runtime_config: RuntimeConfig,
@@ -183,7 +205,40 @@ impl SqliteMediaStore {
         })
     }
 
+    #[cfg(target_family = "wasm")]
+    /// Create an SQLite-based media store using a single WASM connection.
+    async fn open_with_connection(
+        conn: SqliteAsyncConn,
+        secret: Option<Secret>,
+        db_name: String,
+        runtime_config: RuntimeConfig,
+    ) -> Result<Self, OpenStoreError> {
+        let version = conn.db_version().await?;
+        run_migrations(&conn, version).await?;
+
+        conn.wal_checkpoint().await;
+
+        let store_cipher = match &secret {
+            Some(s) => Some(Arc::new(conn.get_or_create_store_cipher(s.clone()).await?)),
+            None => None,
+        };
+
+        let media_service = MediaService::new();
+        let media_retention_policy = conn.get_serialized_kv(keys::MEDIA_RETENTION_POLICY).await?;
+        let last_media_cleanup_time = conn.get_serialized_kv(keys::LAST_MEDIA_CLEANUP_TIME).await?;
+        media_service.restore(media_retention_policy, last_media_cleanup_time);
+
+        Ok(Self {
+            store_cipher,
+            connections: Arc::new(Mutex::new(Some(SqliteConnections::new(conn)))),
+            db_name,
+            runtime_config,
+            media_service,
+        })
+    }
+
     // Acquire a connection for executing read operations.
+    #[cfg(not(target_family = "wasm"))]
     #[instrument(skip_all)]
     async fn read(&self) -> Result<SqliteAsyncConn> {
         let pool = {
@@ -201,6 +256,14 @@ impl SqliteMediaStore {
         connection.execute_batch("PRAGMA foreign_keys = ON;").await?;
 
         Ok(connection)
+    }
+
+    #[cfg(target_family = "wasm")]
+    #[instrument(skip_all)]
+    async fn read(&self) -> Result<SqliteAsyncConn> {
+        let guard = self.connections.lock().await;
+        let conns = guard.as_ref().ok_or(Error::StoreClosed)?;
+        Ok(conns.conn.clone())
     }
 
     // Acquire a connection for executing write operations.
@@ -233,12 +296,8 @@ impl SqliteMediaStore {
     }
 
     async fn get_db_size(&self) -> Result<Option<usize>> {
-        let pool = {
-            let guard = self.connections.lock().await;
-            let conns = guard.as_ref().ok_or(Error::StoreClosed)?;
-            conns.pool.clone()
-        };
-        Ok(Some(pool.get().await?.get_db_size().await?))
+        let read_conn = self.read().await?;
+        Ok(Some(read_conn.get_db_size().await?))
     }
 
     pub async fn close(&self) -> Result<()> {
@@ -247,18 +306,26 @@ impl SqliteMediaStore {
     }
 
     pub async fn reopen(&self) -> Result<()> {
-        connection::reopen_connections(
-            &self.connections,
-            self.db_path.clone(),
-            self.pool_config,
-            self.runtime_config,
-        )
-        .await?;
+        #[cfg(not(target_family = "wasm"))]
+        {
+            connection::reopen_connections(
+                &self.connections,
+                self.db_path.clone(),
+                self.pool_config,
+                self.runtime_config,
+            )
+            .await?;
+        }
+        #[cfg(target_family = "wasm")]
+        {
+            connection::reopen_connections(&self.connections, &self.db_name, self.runtime_config)
+                .await?;
+        }
         Ok(())
     }
 
     /// Returns the pool size status, for testing purposes.
-    #[cfg(test)]
+    #[cfg(all(test, not(target_family = "wasm")))]
     async fn pool_max_size(&self) -> Option<usize> {
         let guard = self.connections.lock().await;
         guard.as_ref().map(|conns| conns.pool.status().max_size)
@@ -296,7 +363,8 @@ async fn run_migrations(conn: &SqliteAsyncConn, version: u8) -> Result<()> {
     Ok(())
 }
 
-#[async_trait]
+#[cfg_attr(target_family = "wasm", async_trait(?Send))]
+#[cfg_attr(not(target_family = "wasm"), async_trait)]
 impl MediaStore for SqliteMediaStore {
     type Error = Error;
 
@@ -738,7 +806,7 @@ impl MediaStoreInner for SqliteMediaStore {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_family = "wasm")))]
 mod tests {
     use std::{
         path::PathBuf,
@@ -872,7 +940,7 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_family = "wasm")))]
 mod close_reopen_tests {
     use std::sync::{
         LazyLock,
@@ -1109,7 +1177,7 @@ mod close_reopen_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_family = "wasm")))]
 mod encrypted_tests {
     use std::sync::{
         LazyLock,

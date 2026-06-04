@@ -29,26 +29,44 @@ experimental-push-secrets = [
 [dependencies]
 as_variant.workspace = true
 async-trait.workspace = true
-deadpool = { version = "0.13", default-features = false, features = ["managed", "rt_tokio_1"] }
-deadpool-sync = { version = "0.2", default-features = false }
 itertools.workspace = true
 matrix-sdk-base = { workspace = true, optional = true }
 matrix-sdk-crypto = { workspace = true, optional = true }
 matrix-sdk-store-encryption.workspace = true
-num_cpus = { version = "1.17.0", default-features = false }
 rmp-serde.workspace = true
 ruma.workspace = true
-rusqlite = { version = "0.37.0", default-features = false, features = ["limits"] }
+rusqlite = { version = "0.39.0", default-features = false, features = ["limits", "cache", "fallible_uint"] }
 serde.workspace = true
 serde_json.workspace = true
 serde_path_to_error = { version = "0.1.20", default-features = false }
 thiserror.workspace = true
-tokio = { workspace = true, features = ["fs"] }
 tracing.workspace = true
 vodozemac.workspace = true
 zeroize.workspace = true
 
-[dev-dependencies]
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+deadpool = { version = "0.13", default-features = false, features = ["managed", "rt_tokio_1"] }
+deadpool-sync = { version = "0.2", default-features = false }
+num_cpus = { version = "1.17.0", default-features = false }
+tokio = { workspace = true, features = ["fs", "sync"] }
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+sqlite-wasm-rs = { version = "0.5", default-features = false }
+sqlite-wasm-vfs = "0.2"
+send_wrapper = "0.6"
+tokio = { workspace = true }
+# The following dependencies are not used directly. They only enable the
+# WASM-compatible features of transitive dependencies.
+matrix-sdk-common = { workspace = true, features = ["js"] }
+getrandom_02 = { package = "getrandom", version = "0.2", features = ["js"] }
+getrandom_04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] }
+uuid = { workspace = true, features = ["js", "v4"] }
+web-time = { version = "1.1.0", features = ["serde"] }
+
+# The bulk of the test suite (including the store integration test macros)
+# only runs natively; the corresponding dev-dependencies do not build for WASM
+# (e.g. `tokio`'s multi-threaded runtime), so they are target-gated.
+[target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
 assert_matches.workspace = true
 glob = "0.3.3"
 matrix-sdk-base = { workspace = true, features = ["testing"] }
@@ -59,6 +77,9 @@ matrix-sdk-test-utils.workspace = true
 similar-asserts.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+
+[target.'cfg(target_family = "wasm")'.dev-dependencies]
+wasm-bindgen-test = "0.3.50"
 
 [lints]
 workspace = true
