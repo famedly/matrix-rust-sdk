@@ -261,6 +261,18 @@ jobs:
           - name: '[m], indexeddb stores, no crypto'
             cmd: matrix-sdk-indexeddb-stores-no-crypto
 
+          # The sqlite wasm-pack tests require OPFS and a dedicated worker,
+          # which the Node.js runner does not provide, so only run the clippy
+          # check here. The tests can be run locally with e.g.
+          # `cargo xtask ci wasm-pack sqlite-all-features --runner chrome`.
+          - name: '[m]-sqlite'
+            cmd: sqlite-all-features
+            check_only: true
+
+          - name: '[m], sqlite stores'
+            cmd: matrix-sdk-sqlite-stores
+            check_only: true
+
     steps:
       - name: Checkout the repo
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0

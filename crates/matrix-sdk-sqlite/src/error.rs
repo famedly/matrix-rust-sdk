@@ -24,21 +24,22 @@ use matrix_sdk_base::store::StoreError as StateStoreError;
 #[cfg(feature = "crypto-store")]
 use matrix_sdk_crypto::CryptoStoreError;
 use thiserror::Error;
-use tokio::io;
 
-use crate::connection::{CreatePoolError, PoolError};
+use crate::connection::{AcquireConnectionError, OpenConnectionError};
 
 /// All the errors that can occur when opening an SQLite store.
 #[derive(Error, Debug)]
 #[non_exhaustive]
 pub enum OpenStoreError {
     /// Failed to create the DB's parent directory.
+    #[cfg(not(target_family = "wasm"))]
     #[error("Failed to create the database's parent directory: {0}")]
-    CreateDir(#[source] io::Error),
+    CreateDir(#[source] tokio::io::Error),
 
-    /// Failed to create the DB pool.
+    /// Failed to open the DB connections (natively: create the connection
+    /// pool).
     #[error(transparent)]
-    CreatePool(#[from] CreatePoolError),
+    CreatePool(#[from] OpenConnectionError),
 
     /// Failed to load the database's version.
     #[error("Failed to load database version: {0}")]
@@ -56,9 +57,9 @@ pub enum OpenStoreError {
     #[error("Failed to run migrations: {0}")]
     Migration(#[from] Error),
 
-    /// Failed to get a DB connection from the pool.
+    /// Failed to acquire a DB connection (natively: from the pool).
     #[error(transparent)]
-    Pool(#[from] PoolError),
+    Pool(#[from] AcquireConnectionError),
 
     /// Failed to initialize the store cipher.
     #[error("Failed to initialize the store cipher: {0}")]
@@ -82,7 +83,7 @@ pub enum Error {
     SqliteMaximumVariableNumber(i32),
 
     #[error(transparent)]
-    Pool(PoolError),
+    Pool(AcquireConnectionError),
 
     #[error(transparent)]
     Encode(rmp_serde::encode::Error),
@@ -144,7 +145,7 @@ impl From<rusqlite::Error> for Error {
     }
 }
 
-impl_from!(PoolError => Error::Pool);
+impl_from!(AcquireConnectionError => Error::Pool);
 impl_from!(rmp_serde::encode::Error => Error::Encode);
 impl_from!(rmp_serde::decode::Error => Error::Decode);
 impl_from!(matrix_sdk_store_encryption::Error => Error::Encryption);

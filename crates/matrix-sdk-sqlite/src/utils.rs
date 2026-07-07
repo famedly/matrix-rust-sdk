@@ -21,6 +21,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+#[cfg(not(target_family = "wasm"))]
 use deadpool_sync::InteractError;
 use itertools::Itertools;
 use matrix_sdk_store_encryption::StoreCipher;
@@ -65,7 +66,8 @@ impl rusqlite::ToSql for Key {
     }
 }
 
-#[async_trait]
+#[cfg_attr(target_family = "wasm", async_trait(?Send))]
+#[cfg_attr(not(target_family = "wasm"), async_trait)]
 pub(crate) trait SqliteAsyncConnExt {
     async fn execute<P>(
         &self,
@@ -114,9 +116,15 @@ pub(crate) trait SqliteAsyncConnExt {
         E: From<rusqlite::Error> + Send + 'static,
         F: FnOnce(&Transaction<'_>) -> Result<T, E> + Send + 'static;
 
+    /// Chunk a large query over some keys.
+    ///
+    /// Imagine there is a _dynamic_ query that runs potentially large number of
+    /// parameters, so much that the maximum number of parameters can be hit.
+    /// Then, this helper is for you. It will execute the query on chunks of
+    /// parameters.
     async fn chunk_large_query_over<Query, Res>(
         &self,
-        mut keys_to_chunk: Vec<Key>,
+        keys_to_chunk: Vec<Key>,
         result_capacity: Option<usize>,
         do_query: Query,
     ) -> Result<Vec<Res>>
@@ -240,6 +248,11 @@ pub(crate) trait SqliteAsyncConnExt {
     }
 }
 
+// ===========================================================================
+// Native implementation — delegates to SyncWrapper::interact
+// ===========================================================================
+
+#[cfg(not(target_family = "wasm"))]
 #[async_trait]
 impl SqliteAsyncConnExt for SqliteAsyncConn {
     async fn execute<P>(
@@ -325,12 +338,6 @@ impl SqliteAsyncConnExt for SqliteAsyncConn {
         .map_err(E::from)?
     }
 
-    /// Chunk a large query over some keys.
-    ///
-    /// Imagine there is a _dynamic_ query that runs potentially large number of
-    /// parameters, so much that the maximum number of parameters can be hit.
-    /// Then, this helper is for you. It will execute the query on chunks of
-    /// parameters.
     async fn chunk_large_query_over<Query, Res>(
         &self,
         keys_to_chunk: Vec<Key>,
@@ -353,6 +360,7 @@ impl SqliteAsyncConnExt for SqliteAsyncConn {
 /// An [`InteractError::Panic`] will panic. An [`InteractError::Cancelled`] will
 /// generate a [`rusqlite::Error::SqliteFailure`] with the
 /// [`rusqlite::ffi::SQLITE_ABORT`] code.
+#[cfg(not(target_family = "wasm"))]
 fn map_interact_err(error: InteractError) -> rusqlite::Error {
     match error {
         InteractError::Panic(p) => panic!("{p:?}"),
@@ -362,6 +370,106 @@ fn map_interact_err(error: InteractError) -> rusqlite::Error {
         ),
     }
 }
+
+// ===========================================================================
+// WASM implementation — calls synchronous rusqlite API inline
+// ===========================================================================
+
+#[cfg(target_family = "wasm")]
+#[async_trait(?Send)]
+impl SqliteAsyncConnExt for SqliteAsyncConn {
+    async fn execute<P>(
+        &self,
+        sql: impl AsRef<str> + Send + 'static,
+        params: P,
+    ) -> rusqlite::Result<usize>
+    where
+        P: Params + Send + 'static,
+    {
+        self.interact(move |conn| conn.execute(sql.as_ref(), params))
+    }
+
+    async fn execute_batch(&self, sql: impl AsRef<str> + Send + 'static) -> rusqlite::Result<()> {
+        self.interact(move |conn| conn.execute_batch(sql.as_ref()))
+    }
+
+    async fn prepare<T, F>(
+        &self,
+        sql: impl AsRef<str> + Send + 'static,
+        f: F,
+    ) -> rusqlite::Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(Statement<'_>) -> rusqlite::Result<T> + Send + 'static,
+    {
+        self.interact(move |conn| f(conn.prepare(sql.as_ref())?))
+    }
+
+    async fn query_row<T, P, F>(
+        &self,
+        sql: impl AsRef<str> + Send + 'static,
+        params: P,
+        f: F,
+    ) -> rusqlite::Result<T>
+    where
+        T: Send + 'static,
+        P: Params + Send + 'static,
+        F: FnOnce(&Row<'_>) -> rusqlite::Result<T> + Send + 'static,
+    {
+        self.interact(move |conn| conn.query_row(sql.as_ref(), params, f))
+    }
+
+    async fn query_many<T, P, F>(
+        &self,
+        sql: impl AsRef<str> + Send + 'static,
+        params: P,
+        f: F,
+    ) -> rusqlite::Result<Vec<T>>
+    where
+        T: Send + 'static,
+        P: Params + Send + 'static,
+        F: FnMut(&Row<'_>) -> rusqlite::Result<T> + Send + 'static,
+    {
+        self.interact(move |conn| {
+            let mut stmt = conn.prepare(sql.as_ref())?;
+            stmt.query_and_then(params, f)?.collect()
+        })
+    }
+
+    async fn with_transaction<T, E, F>(&self, f: F) -> Result<T, E>
+    where
+        T: Send + 'static,
+        E: From<rusqlite::Error> + Send + 'static,
+        F: FnOnce(&Transaction<'_>) -> Result<T, E> + Send + 'static,
+    {
+        self.interact(move |conn| {
+            let txn = conn.transaction()?;
+            let result = f(&txn)?;
+            txn.commit()?;
+            Ok(result)
+        })
+    }
+
+    async fn chunk_large_query_over<Query, Res>(
+        &self,
+        keys_to_chunk: Vec<Key>,
+        result_capacity: Option<usize>,
+        do_query: Query,
+    ) -> Result<Vec<Res>>
+    where
+        Res: Send + 'static,
+        Query: Fn(&Transaction<'_>, Vec<Key>) -> Result<Vec<Res>> + Send + 'static,
+    {
+        self.with_transaction(move |txn| {
+            txn.chunk_large_query_over(keys_to_chunk, result_capacity, do_query)
+        })
+        .await
+    }
+}
+
+// ===========================================================================
+// Shared helpers (both targets)
+// ===========================================================================
 
 pub(crate) trait SqliteTransactionExt {
     fn chunk_large_query_over<Key, Query, Res>(
@@ -477,7 +585,8 @@ impl SqliteKeyValueStoreConnExt for rusqlite::Connection {
 ///     "value" BLOB NOT NULL
 /// );
 /// ```
-#[async_trait]
+#[cfg_attr(target_family = "wasm", async_trait(?Send))]
+#[cfg_attr(not(target_family = "wasm"), async_trait)]
 pub(crate) trait SqliteKeyValueStoreAsyncConnExt: SqliteAsyncConnExt {
     /// Whether the `kv` table exists in this database.
     async fn kv_table_exists(&self) -> rusqlite::Result<bool> {
@@ -569,12 +678,12 @@ pub(crate) trait SqliteKeyValueStoreAsyncConnExt: SqliteAsyncConnExt {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 #[async_trait]
 impl SqliteKeyValueStoreAsyncConnExt for SqliteAsyncConn {
     async fn set_kv(&self, key: &str, value: Vec<u8>) -> rusqlite::Result<()> {
         let key = key.to_owned();
         self.interact(move |conn| conn.set_kv(&key, &value)).await.unwrap()?;
-
         Ok(())
     }
 
@@ -585,14 +694,38 @@ impl SqliteKeyValueStoreAsyncConnExt for SqliteAsyncConn {
     ) -> Result<()> {
         let key = key.to_owned();
         self.interact(move |conn| conn.set_serialized_kv(&key, value)).await.unwrap()?;
-
         Ok(())
     }
 
     async fn clear_kv(&self, key: &str) -> rusqlite::Result<()> {
         let key = key.to_owned();
         self.interact(move |conn| conn.clear_kv(&key)).await.unwrap()?;
+        Ok(())
+    }
+}
 
+#[cfg(target_family = "wasm")]
+#[async_trait(?Send)]
+impl SqliteKeyValueStoreAsyncConnExt for SqliteAsyncConn {
+    async fn set_kv(&self, key: &str, value: Vec<u8>) -> rusqlite::Result<()> {
+        let key = key.to_owned();
+        self.interact(move |conn| conn.set_kv(&key, &value))?;
+        Ok(())
+    }
+
+    async fn set_serialized_kv<T: Serialize + Send + 'static>(
+        &self,
+        key: &str,
+        value: T,
+    ) -> Result<()> {
+        let key = key.to_owned();
+        self.interact(move |conn| conn.set_serialized_kv(&key, value))?;
+        Ok(())
+    }
+
+    async fn clear_kv(&self, key: &str) -> rusqlite::Result<()> {
+        let key = key.to_owned();
+        self.interact(move |conn| conn.clear_kv(&key))?;
         Ok(())
     }
 }
@@ -706,7 +839,7 @@ pub(crate) trait EncryptableStore {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_family = "wasm")))]
 mod unit_tests {
     use std::time::Duration;
 

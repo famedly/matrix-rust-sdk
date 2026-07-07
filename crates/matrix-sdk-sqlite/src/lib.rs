@@ -28,12 +28,17 @@ mod media_store;
 #[cfg(feature = "state-store")]
 mod state_store;
 mod utils;
+
+use std::fmt;
+#[cfg(target_family = "wasm")]
+use std::path::Path;
+#[cfg(not(target_family = "wasm"))]
 use std::{
     cmp::max,
-    fmt,
     path::{Path, PathBuf},
 };
 
+#[cfg(not(target_family = "wasm"))]
 use deadpool::managed::PoolConfig;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
@@ -47,7 +52,7 @@ pub use self::media_store::SqliteMediaStore;
 #[cfg(feature = "state-store")]
 pub use self::state_store::{DATABASE_NAME as STATE_STORE_DATABASE_NAME, SqliteStateStore};
 
-#[cfg(test)]
+#[cfg(all(test, not(target_family = "wasm")))]
 matrix_sdk_test_utils::init_tracing_for_tests!();
 
 /// An enum used to store the secret that gives access to a store
@@ -59,7 +64,12 @@ pub enum Secret {
     PassPhrase(Zeroizing<String>),
 }
 
+// ===========================================================================
+// Native SqliteStoreConfig — connection pool based
+// ===========================================================================
+
 /// A configuration structure used for opening a store.
+#[cfg(not(target_family = "wasm"))]
 #[derive(Clone)]
 pub struct SqliteStoreConfig {
     /// Path to the database, without the file name.
@@ -72,6 +82,7 @@ pub struct SqliteStoreConfig {
     runtime_config: RuntimeConfig,
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl fmt::Debug for SqliteStoreConfig {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -85,10 +96,12 @@ impl fmt::Debug for SqliteStoreConfig {
 
 /// The minimum size of the connections pool.
 ///
-/// We need at least 2 connections: one connection for write operations, and one
+/// We need at least 2 connections: one connection for write operations, and one
 /// connection for read operations.
+#[cfg(not(target_family = "wasm"))]
 const POOL_MINIMUM_SIZE: usize = 2;
 
+#[cfg(not(target_family = "wasm"))]
 impl SqliteStoreConfig {
     /// Create a new [`SqliteStoreConfig`] with a path representing the
     /// directory containing the store database.
@@ -234,6 +247,147 @@ impl SqliteStoreConfig {
     }
 }
 
+// ===========================================================================
+// WASM SqliteStoreConfig — single connection, OPFS-backed
+// ===========================================================================
+
+/// A configuration structure used for opening a store.
+///
+/// # WASM specifics
+///
+/// On the `wasm32-unknown-unknown` target, the stores are backed by SQLite
+/// databases living in the [Origin Private File System] (OPFS). This comes
+/// with constraints that the embedding application must uphold:
+///
+/// - **Single dedicated Web Worker.** All stores must be created and used from
+///   one dedicated Web Worker. OPFS synchronous access handles are unavailable
+///   on the main thread, and the connection wrapper panics when accessed from a
+///   thread other than the one that created it.
+/// - **No concurrent tabs.** OPFS synchronous access handles are exclusive per
+///   agent. A second tab or worker opening the same stores will fail with an
+///   `OpenStoreError`. Coordinate access at the application level, e.g. with a
+///   `SharedWorker` or the [Web Locks API].
+/// - **Queries run synchronously.** Unlike the native backend, which executes
+///   queries on blocking threads, queries on WASM run inline and block the
+///   worker's event loop until they complete.
+/// - **The path is a name prefix.** OPFS has no filesystem hierarchy; the
+///   `path` passed to [`SqliteStoreConfig::new`] is used as a plain prefix for
+///   the database names.
+///
+/// [Origin Private File System]: https://developer.mozilla.org/en-US/docs/Web/API/File_System_API/Origin_private_file_system
+/// [Web Locks API]: https://developer.mozilla.org/en-US/docs/Web/API/Web_Locks_API
+#[cfg(target_family = "wasm")]
+#[derive(Clone)]
+pub struct SqliteStoreConfig {
+    /// Database name prefix (OPFS has no filesystem hierarchy).
+    db_name: String,
+    /// Secret to open the store, if any.
+    secret: Option<Secret>,
+    /// The runtime configuration to apply when opening an SQLite connection.
+    runtime_config: RuntimeConfig,
+}
+
+#[cfg(target_family = "wasm")]
+impl fmt::Debug for SqliteStoreConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SqliteStoreConfig")
+            .field("db_name", &self.db_name)
+            .field("runtime_config", &self.runtime_config)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(target_family = "wasm")]
+impl SqliteStoreConfig {
+    /// Create a new [`SqliteStoreConfig`].
+    ///
+    /// On WASM, `path` is used as a database name prefix (OPFS has no
+    /// filesystem hierarchy).
+    pub fn new<P>(path: P) -> Self
+    where
+        P: AsRef<Path>,
+    {
+        Self {
+            db_name: path.as_ref().to_string_lossy().into_owned(),
+            runtime_config: RuntimeConfig::default(),
+            secret: None,
+        }
+    }
+
+    /// Similar to [`SqliteStoreConfig::new`], but with defaults tailored for a
+    /// low memory usage environment.
+    pub fn with_low_memory_config<P>(path: P) -> Self
+    where
+        P: AsRef<Path>,
+    {
+        let mut s = Self::new(path);
+        s.runtime_config.cache_size = 500_000;
+        s.runtime_config.journal_size_limit = 2_000_000;
+        s
+    }
+
+    /// Override the database name prefix.
+    pub fn path<P>(mut self, path: P) -> Self
+    where
+        P: AsRef<Path>,
+    {
+        self.db_name = path.as_ref().to_string_lossy().into_owned();
+        self
+    }
+
+    /// Define the passphrase if the store is encoded.
+    pub fn passphrase(mut self, passphrase: Option<&str>) -> Self {
+        self.secret =
+            passphrase.map(|passphrase| Secret::PassPhrase(Zeroizing::new(passphrase.to_owned())));
+        self
+    }
+
+    /// Define the key if the store is encoded.
+    pub fn key(mut self, key: Option<&[u8; 32]>) -> Self {
+        self.secret = key.map(|key| Secret::Key(Box::new(*key)));
+        self
+    }
+
+    /// Optimize the database. See [`PRAGMA optimize`].
+    ///
+    /// [`PRAGMA optimize`]: https://www.sqlite.org/pragma.html#pragma_optimize
+    pub fn optimize(mut self, optimize: bool) -> Self {
+        self.runtime_config.optimize = optimize;
+        self
+    }
+
+    /// Define the maximum size in **bytes** the SQLite cache can use.
+    pub fn cache_size(mut self, cache_size: u32) -> Self {
+        self.runtime_config.cache_size = cache_size;
+        self
+    }
+
+    /// Limit the size of the WAL file, in **bytes**.
+    pub fn journal_size_limit(mut self, limit: u32) -> Self {
+        self.runtime_config.journal_size_limit = limit;
+        self
+    }
+
+    /// Returns the runtime configuration.
+    pub(crate) fn runtime_config(&self) -> RuntimeConfig {
+        self.runtime_config
+    }
+
+    /// Build a single WASM connection for a given database.
+    pub(crate) async fn build_wasm_connection(
+        &self,
+        database_name: &str,
+    ) -> Result<connection::Connection, connection::OpenConnectionError> {
+        let full_name = format!("{}-{}", self.db_name, database_name);
+        connection::open_wasm_connection(&full_name).await
+    }
+}
+
+// ===========================================================================
+// Shared types
+// ===========================================================================
+
 /// This type represents values to set at runtime when a database is opened.
 ///
 /// This configuration is applied by
@@ -266,15 +420,18 @@ impl Default for RuntimeConfig {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_family = "wasm")))]
 mod tests {
     use std::{
         ops::Not,
         path::{Path, PathBuf},
     };
 
-    use super::{POOL_MINIMUM_SIZE, Secret, SqliteStoreConfig};
+    #[cfg(not(target_family = "wasm"))]
+    use super::POOL_MINIMUM_SIZE;
+    use super::{Secret, SqliteStoreConfig};
 
+    #[cfg(not(target_family = "wasm"))]
     #[test]
     fn test_new() {
         let store_config = SqliteStoreConfig::new(Path::new("foo"));
@@ -285,6 +442,7 @@ mod tests {
         assert_eq!(store_config.runtime_config.journal_size_limit, 10_000_000);
     }
 
+    #[cfg(not(target_family = "wasm"))]
     #[test]
     fn test_with_low_memory_config() {
         let store_config = SqliteStoreConfig::with_low_memory_config(Path::new("foo"));
@@ -295,6 +453,7 @@ mod tests {
         assert_eq!(store_config.runtime_config.journal_size_limit, 2_000_000);
     }
 
+    #[cfg(not(target_family = "wasm"))]
     #[test]
     fn test_store_config_when_passphrase() {
         let store_config = SqliteStoreConfig::new(Path::new("foo"))
@@ -312,6 +471,7 @@ mod tests {
         assert_eq!(store_config.runtime_config.journal_size_limit, 44);
     }
 
+    #[cfg(not(target_family = "wasm"))]
     #[test]
     fn test_store_config_when_key() {
         let store_config = SqliteStoreConfig::new(Path::new("foo"))
@@ -338,17 +498,17 @@ mod tests {
         assert_eq!(store_config.runtime_config.journal_size_limit, 44);
     }
 
+    #[cfg(not(target_family = "wasm"))]
     #[test]
     fn test_store_config_path() {
         let store_config = SqliteStoreConfig::new(Path::new("foo")).path(Path::new("bar"));
-
         assert_eq!(store_config.path, PathBuf::from("bar"));
     }
 
+    #[cfg(not(target_family = "wasm"))]
     #[test]
     fn test_pool_size_has_a_minimum() {
         let store_config = SqliteStoreConfig::new(Path::new("foo")).pool_max_size(1);
-
         assert_eq!(store_config.pool_config.max_size, POOL_MINIMUM_SIZE);
     }
 }

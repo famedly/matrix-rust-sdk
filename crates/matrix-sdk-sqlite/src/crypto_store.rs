@@ -12,15 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#[cfg(not(target_family = "wasm"))]
+use std::path::PathBuf;
 use std::{
     collections::HashMap,
     fmt,
     ops::Deref,
-    path::{Path, PathBuf},
+    path::Path,
     sync::{Arc, RwLock},
 };
 
 use async_trait::async_trait;
+#[cfg(not(target_family = "wasm"))]
 use deadpool::managed::PoolConfig;
 use matrix_sdk_base::cross_process_lock::CrossProcessLockGeneration;
 use matrix_sdk_crypto::{
@@ -44,17 +47,16 @@ use ruma::{
     events::secret::request::SecretName,
 };
 use rusqlite::{OptionalExtension, named_params, params_from_iter};
-use tokio::{
-    fs,
-    sync::{Mutex, OwnedMutexGuard},
-};
+#[cfg(not(target_family = "wasm"))]
+use tokio::fs;
+use tokio::sync::{Mutex, OwnedMutexGuard};
 use tracing::{debug, instrument, warn};
 use vodozemac::Curve25519PublicKey;
 use zeroize::Zeroizing;
 
 use crate::{
     OpenStoreError, RuntimeConfig, Secret, SqliteStoreConfig,
-    connection::{self, Connection as SqliteAsyncConn, Pool as SqlitePool, SqliteConnections},
+    connection::{self, Connection as SqliteAsyncConn, SqliteConnections},
     error::{Error, Result},
     utils::{
         EncryptableStore, Key, SqliteAsyncConnExt, SqliteKeyValueStoreAsyncConnExt,
@@ -74,9 +76,15 @@ pub struct SqliteCryptoStore {
     /// The outer `Mutex` serialises close/reopen with connection access.
     connections: Arc<Mutex<Option<SqliteConnections>>>,
 
+    #[cfg(not(target_family = "wasm"))]
     /// Retained so we can rebuild the pool on reopen.
     db_path: PathBuf,
 
+    #[cfg(target_family = "wasm")]
+    /// Retained so we can rebuild the connection on reopen.
+    db_name: String,
+
+    #[cfg(not(target_family = "wasm"))]
     /// Retained so we can rebuild the pool on reopen.
     pool_config: PoolConfig,
 
@@ -102,6 +110,7 @@ impl EncryptableStore for SqliteCryptoStore {
 }
 
 impl SqliteCryptoStore {
+    #[cfg(not(target_family = "wasm"))]
     /// Create an `SqliteCryptoStore` struct without trying to create the
     /// database or migrate to a newer version.  This is only for use
     /// internally, and for testing.
@@ -115,7 +124,7 @@ impl SqliteCryptoStore {
     /// * `conn` - The connection to use for writing to the store.
     pub(crate) async fn create_raw(
         secret: Option<Secret>,
-        pool: SqlitePool,
+        pool: connection::Pool,
         conn: SqliteAsyncConn,
         pool_config: PoolConfig,
         runtime_config: RuntimeConfig,
@@ -159,6 +168,7 @@ impl SqliteCryptoStore {
         Self::open_with_config(&SqliteStoreConfig::new(path).key(key)).await
     }
 
+    #[cfg(not(target_family = "wasm"))]
     /// Open the SQLite-based crypto store with the config open config.
     pub async fn open_with_config(config: &SqliteStoreConfig) -> Result<Self, OpenStoreError> {
         fs::create_dir_all(&config.path).await.map_err(OpenStoreError::CreateDir)?;
@@ -174,10 +184,25 @@ impl SqliteCryptoStore {
         Ok(this)
     }
 
+    #[cfg(target_family = "wasm")]
+    /// Open the SQLite-based crypto store with the config open config.
+    pub async fn open_with_config(config: &SqliteStoreConfig) -> Result<Self, OpenStoreError> {
+        let runtime_config = config.runtime_config();
+        let conn = config.build_wasm_connection(DATABASE_NAME).await?;
+        let db_name = format!("{}-{}", config.db_name, DATABASE_NAME);
+
+        let this = Self::open_with_connection(conn, config.secret.clone(), db_name, runtime_config)
+            .await?;
+        this.read().await?.apply_runtime_config(runtime_config).await?;
+
+        Ok(this)
+    }
+
+    #[cfg(not(target_family = "wasm"))]
     /// Create an SQLite-based crypto store using the given SQLite database
     /// pool. The given secret will be used to encrypt private data.
     async fn open_with_pool(
-        pool: SqlitePool,
+        pool: connection::Pool,
         secret: Option<Secret>,
         pool_config: PoolConfig,
         runtime_config: RuntimeConfig,
@@ -190,6 +215,40 @@ impl SqliteCryptoStore {
         let version = initialize_store(&conn, version).await?;
 
         let store = Self::create_raw(secret, pool, conn, pool_config, runtime_config).await?;
+
+        run_migrations(&store, version, None).await?;
+
+        store.write().await?.wal_checkpoint().await;
+
+        Ok(store)
+    }
+
+    #[cfg(target_family = "wasm")]
+    /// Create an SQLite-based crypto store using a single WASM connection.
+    async fn open_with_connection(
+        conn: SqliteAsyncConn,
+        secret: Option<Secret>,
+        db_name: String,
+        runtime_config: RuntimeConfig,
+    ) -> Result<Self, OpenStoreError> {
+        let version = conn.db_version().await?;
+        debug!("Opened sqlite store with version {}", version);
+
+        let version = initialize_store(&conn, version).await?;
+
+        let store_cipher = match secret {
+            Some(s) => Some(Arc::new(conn.get_or_create_store_cipher(s).await?)),
+            None => None,
+        };
+
+        let store = Self {
+            store_cipher,
+            connections: Arc::new(Mutex::new(Some(SqliteConnections::new(conn)))),
+            db_name,
+            runtime_config,
+            static_account: Arc::new(RwLock::new(None)),
+            save_changes_lock: Default::default(),
+        };
 
         run_migrations(&store, version, None).await?;
 
@@ -226,6 +285,7 @@ impl SqliteCryptoStore {
         self.static_account.read().unwrap().clone()
     }
 
+    #[cfg(not(target_family = "wasm"))]
     /// Acquire a connection for executing read operations.
     #[instrument(skip_all)]
     async fn read(&self) -> Result<SqliteAsyncConn> {
@@ -235,6 +295,15 @@ impl SqliteCryptoStore {
             conns.pool.clone()
         };
         Ok(pool.get().await?)
+    }
+
+    #[cfg(target_family = "wasm")]
+    /// Acquire a connection for executing read operations.
+    #[instrument(skip_all)]
+    async fn read(&self) -> Result<SqliteAsyncConn> {
+        let guard = self.connections.lock().await;
+        let conns = guard.as_ref().ok_or(Error::StoreClosed)?;
+        Ok(conns.conn.clone())
     }
 
     /// Acquire a connection for executing write operations.
@@ -771,7 +840,8 @@ impl SqliteConnectionExt for rusqlite::Connection {
     }
 }
 
-#[async_trait]
+#[cfg_attr(target_family = "wasm", async_trait(?Send))]
+#[cfg_attr(not(target_family = "wasm"), async_trait)]
 trait SqliteObjectCryptoStoreExt: SqliteAsyncConnExt {
     async fn get_sessions_for_sender_key(&self, sender_key: Key) -> Result<Vec<Vec<u8>>> {
         Ok(self
@@ -1106,10 +1176,16 @@ trait SqliteObjectCryptoStoreExt: SqliteAsyncConnExt {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 #[async_trait]
 impl SqliteObjectCryptoStoreExt for SqliteAsyncConn {}
 
-#[async_trait]
+#[cfg(target_family = "wasm")]
+#[async_trait(?Send)]
+impl SqliteObjectCryptoStoreExt for SqliteAsyncConn {}
+
+#[cfg_attr(target_family = "wasm", async_trait(?Send))]
+#[cfg_attr(not(target_family = "wasm"), async_trait)]
 impl CryptoStore for SqliteCryptoStore {
     type Error = Error;
 
@@ -1817,11 +1893,7 @@ impl CryptoStore for SqliteCryptoStore {
 
     async fn remove_custom_value(&self, key: &str) -> Result<()> {
         let key = key.to_owned();
-        self.write()
-            .await?
-            .interact(move |conn| conn.execute("DELETE FROM kv WHERE key = ?1", (&key,)))
-            .await
-            .unwrap()?;
+        self.write().await?.execute("DELETE FROM kv WHERE key = ?1", (key,)).await?;
         Ok(())
     }
 
@@ -1887,13 +1959,21 @@ impl CryptoStore for SqliteCryptoStore {
     }
 
     async fn reopen(&self) -> Result<()> {
-        connection::reopen_connections(
-            &self.connections,
-            self.db_path.clone(),
-            self.pool_config,
-            self.runtime_config,
-        )
-        .await?;
+        #[cfg(not(target_family = "wasm"))]
+        {
+            connection::reopen_connections(
+                &self.connections,
+                self.db_path.clone(),
+                self.pool_config,
+                self.runtime_config,
+            )
+            .await?;
+        }
+        #[cfg(target_family = "wasm")]
+        {
+            connection::reopen_connections(&self.connections, &self.db_name, self.runtime_config)
+                .await?;
+        }
         Ok(())
     }
 
@@ -1902,7 +1982,7 @@ impl CryptoStore for SqliteCryptoStore {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_family = "wasm")))]
 mod tests {
     use std::{path::Path, sync::LazyLock};
 
@@ -2550,7 +2630,7 @@ mod tests {
     cryptostore_integration_tests_time!();
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_family = "wasm")))]
 mod encrypted_tests {
     use std::sync::LazyLock;
 
@@ -2583,7 +2663,7 @@ mod encrypted_tests {
     cryptostore_integration_tests_time!();
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_family = "wasm")))]
 mod close_reopen_tests {
     use std::sync::LazyLock;
 

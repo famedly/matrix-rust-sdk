@@ -1,13 +1,16 @@
+#[cfg(not(target_family = "wasm"))]
+use std::path::PathBuf;
 use std::{
     borrow::Cow,
     collections::{BTreeMap, BTreeSet, HashMap},
     fmt, iter,
-    path::{Path, PathBuf},
+    path::Path,
     str::FromStr as _,
     sync::Arc,
 };
 
 use async_trait::async_trait;
+#[cfg(not(target_family = "wasm"))]
 use deadpool::managed::PoolConfig;
 use matrix_sdk_base::{
     MinimalRoomMemberEvent, ROOM_VERSION_FALLBACK, ROOM_VERSION_RULES_FALLBACK, RoomInfo,
@@ -39,15 +42,14 @@ use ruma::{
 };
 use rusqlite::{OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
-use tokio::{
-    fs,
-    sync::{Mutex, OwnedMutexGuard},
-};
+#[cfg(not(target_family = "wasm"))]
+use tokio::fs;
+use tokio::sync::{Mutex, OwnedMutexGuard};
 use tracing::{debug, instrument, warn};
 
 use crate::{
     OpenStoreError, RuntimeConfig, Secret, SqliteStoreConfig,
-    connection::{self, Connection as SqliteAsyncConn, Pool as SqlitePool, SqliteConnections},
+    connection::{self, Connection as SqliteAsyncConn, SqliteConnections},
     error::{Error, Result},
     utils::{
         EncryptableStore, Key, SqliteAsyncConnExt, SqliteKeyValueStoreAsyncConnExt,
@@ -83,9 +85,15 @@ pub struct SqliteStateStore {
     /// `Some` when active, `None` when closed.
     connections: Arc<Mutex<Option<SqliteConnections>>>,
 
+    #[cfg(not(target_family = "wasm"))]
     /// Retained so we can rebuild the pool on reopen.
     db_path: PathBuf,
 
+    #[cfg(target_family = "wasm")]
+    /// Retained so we can rebuild the connection on reopen.
+    db_name: String,
+
+    #[cfg(not(target_family = "wasm"))]
     /// Retained so we can rebuild the pool on reopen.
     pool_config: PoolConfig,
 
@@ -119,13 +127,14 @@ impl SqliteStateStore {
         Self::open_with_config(&SqliteStoreConfig::new(path).key(key)).await
     }
 
+    #[cfg(not(target_family = "wasm"))]
     /// Open the SQLite-based state store with the config open config.
     pub async fn open_with_config(config: &SqliteStoreConfig) -> Result<Self, OpenStoreError> {
         fs::create_dir_all(&config.path).await.map_err(OpenStoreError::CreateDir)?;
 
         let pool = config.build_pool_of_connections(DATABASE_NAME)?;
-        let pool_config = config.pool_config;
-        let runtime_config = config.runtime_config;
+        let pool_config = config.pool_config();
+        let runtime_config = config.runtime_config();
 
         let this =
             Self::open_with_pool(pool, config.secret.clone(), pool_config, runtime_config).await?;
@@ -134,10 +143,24 @@ impl SqliteStateStore {
         Ok(this)
     }
 
+    #[cfg(target_family = "wasm")]
+    /// Open the SQLite-based state store with the config open config.
+    pub async fn open_with_config(config: &SqliteStoreConfig) -> Result<Self, OpenStoreError> {
+        let runtime_config = config.runtime_config();
+        let conn = config.build_wasm_connection(DATABASE_NAME).await?;
+        let db_name = format!("{}-{}", config.db_name, DATABASE_NAME);
+
+        let this = Self::open_with_connection(conn, config.secret.clone(), db_name, runtime_config)
+            .await?;
+        this.read().await?.apply_runtime_config(runtime_config).await?;
+
+        Ok(this)
+    }
+
+    #[cfg(not(target_family = "wasm"))]
     /// Create an SQLite-based state store using the given SQLite database pool.
-    /// The given secret will be used to encrypt private data.
     pub(crate) async fn open_with_pool(
-        pool: SqlitePool,
+        pool: connection::Pool,
         secret: Option<Secret>,
         pool_config: PoolConfig,
         runtime_config: RuntimeConfig,
@@ -164,6 +187,38 @@ impl SqliteStateStore {
             }))),
             db_path,
             pool_config,
+            runtime_config,
+        };
+        this.run_migrations(version, None).await?;
+
+        this.read().await?.wal_checkpoint().await;
+
+        Ok(this)
+    }
+
+    #[cfg(target_family = "wasm")]
+    /// Create an SQLite-based state store using a single WASM connection.
+    pub(crate) async fn open_with_connection(
+        conn: SqliteAsyncConn,
+        secret: Option<Secret>,
+        db_name: String,
+        runtime_config: RuntimeConfig,
+    ) -> Result<Self, OpenStoreError> {
+        let mut version = conn.db_version().await?;
+
+        if version == 0 {
+            init(&conn).await?;
+            version = 1;
+        }
+
+        let store_cipher = match secret {
+            Some(s) => Some(Arc::new(conn.get_or_create_store_cipher(s).await?)),
+            None => None,
+        };
+        let this = Self {
+            store_cipher,
+            connections: Arc::new(Mutex::new(Some(SqliteConnections::new(conn)))),
+            db_name,
             runtime_config,
         };
         this.run_migrations(version, None).await?;
@@ -565,8 +620,7 @@ impl SqliteStateStore {
         self.encode_key(keys::KV_BLOB, full_key)
     }
 
-    /// Acquire a connection for executing read operations.
-    /// Returns `StoreClosed` if closed.
+    #[cfg(not(target_family = "wasm"))]
     #[instrument(skip_all)]
     async fn read(&self) -> Result<SqliteAsyncConn> {
         let pool = {
@@ -577,8 +631,14 @@ impl SqliteStateStore {
         Ok(pool.get().await?)
     }
 
-    /// Acquire a connection for executing write operations.
-    /// Returns `StoreClosed` if closed.
+    #[cfg(target_family = "wasm")]
+    #[instrument(skip_all)]
+    async fn read(&self) -> Result<SqliteAsyncConn> {
+        let guard = self.connections.lock().await;
+        let conns = guard.as_ref().ok_or(Error::StoreClosed)?;
+        Ok(conns.conn.clone())
+    }
+
     #[instrument(skip_all)]
     async fn write(&self) -> Result<OwnedMutexGuard<SqliteAsyncConn>> {
         let write_conn = {
@@ -918,7 +978,8 @@ impl SqliteConnectionStateStoreExt for rusqlite::Connection {
     }
 }
 
-#[async_trait]
+#[cfg_attr(target_family = "wasm", async_trait(?Send))]
+#[cfg_attr(not(target_family = "wasm"), async_trait)]
 trait SqliteObjectStateStoreExt: SqliteAsyncConnExt {
     async fn get_kv_blob(&self, key: Key) -> Result<Option<Vec<u8>>> {
         Ok(self
@@ -1175,6 +1236,7 @@ trait SqliteObjectStateStoreExt: SqliteAsyncConnExt {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 #[async_trait]
 impl SqliteObjectStateStoreExt for SqliteAsyncConn {
     async fn set_kv_blob(&self, key: Key, value: Vec<u8>) -> Result<()> {
@@ -1182,7 +1244,16 @@ impl SqliteObjectStateStoreExt for SqliteAsyncConn {
     }
 }
 
-#[async_trait]
+#[cfg(target_family = "wasm")]
+#[async_trait(?Send)]
+impl SqliteObjectStateStoreExt for SqliteAsyncConn {
+    async fn set_kv_blob(&self, key: Key, value: Vec<u8>) -> Result<()> {
+        Ok(self.interact(move |conn| conn.set_kv_blob(&key, &value))?)
+    }
+}
+
+#[cfg_attr(target_family = "wasm", async_trait(?Send))]
+#[cfg_attr(not(target_family = "wasm"), async_trait)]
 impl StateStore for SqliteStateStore {
     type Error = Error;
 
@@ -2508,13 +2579,21 @@ impl StateStore for SqliteStateStore {
     }
 
     async fn reopen(&self) -> Result<(), Self::Error> {
-        connection::reopen_connections(
-            &self.connections,
-            self.db_path.clone(),
-            self.pool_config,
-            self.runtime_config,
-        )
-        .await?;
+        #[cfg(not(target_family = "wasm"))]
+        {
+            connection::reopen_connections(
+                &self.connections,
+                self.db_path.clone(),
+                self.pool_config,
+                self.runtime_config,
+            )
+            .await?;
+        }
+        #[cfg(target_family = "wasm")]
+        {
+            connection::reopen_connections(&self.connections, &self.db_name, self.runtime_config)
+                .await?;
+        }
         Ok(())
     }
 }
@@ -2526,7 +2605,7 @@ struct ReceiptData {
     user_id: OwnedUserId,
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_family = "wasm")))]
 mod tests {
     use std::sync::{
         LazyLock,
@@ -2553,7 +2632,7 @@ mod tests {
     statestore_integration_tests!();
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_family = "wasm")))]
 mod encrypted_tests {
     use std::{
         path::PathBuf,
@@ -2637,7 +2716,7 @@ mod encrypted_tests {
     statestore_integration_tests!();
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_family = "wasm")))]
 mod migration_tests {
     use std::{
         path::{Path, PathBuf},
@@ -3061,7 +3140,7 @@ mod migration_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_family = "wasm")))]
 mod close_reopen_tests {
     use std::sync::{
         LazyLock,
@@ -3285,5 +3364,57 @@ mod close_reopen_tests {
         // Verify the store is fully closed.
         let guard = store.connections.lock().await;
         assert!(guard.is_none(), "connections should be None after close");
+    }
+}
+
+/// Smoke tests for the WASM backend.
+///
+/// They must run in a dedicated Web Worker, because OPFS synchronous access
+/// handles are not available on the main thread. Run them with e.g.
+/// `wasm-pack test --chrome --headless`.
+#[cfg(all(test, target_family = "wasm"))]
+mod wasm_tests {
+    use matrix_sdk_base::{StateStore, StateStoreDataKey, StateStoreDataValue};
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    use super::SqliteStateStore;
+    use crate::utils::SqliteAsyncConnExt;
+
+    wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_dedicated_worker);
+
+    #[wasm_bindgen_test]
+    async fn test_smoke() {
+        let store = SqliteStateStore::open("test-state-store-smoke", None).await.unwrap();
+
+        // WAL must actually be enabled. The sahpool VFS has no shared-memory
+        // support, which SQLite only tolerates in exclusive locking mode; if
+        // the `journal_mode` PRAGMA silently failed to switch, this would
+        // return e.g. "delete".
+        let journal_mode: String = store
+            .read()
+            .await
+            .unwrap()
+            .query_row("PRAGMA journal_mode;", (), |row| row.get(0))
+            .await
+            .unwrap();
+        assert_eq!(journal_mode, "wal");
+
+        // Data must survive a close/reopen cycle.
+        store
+            .set_kv_data(
+                StateStoreDataKey::SyncToken,
+                StateStoreDataValue::SyncToken("sync-token".to_owned()),
+            )
+            .await
+            .unwrap();
+
+        store.close().await.unwrap();
+        store.reopen().await.unwrap();
+
+        let value = store.get_kv_data(StateStoreDataKey::SyncToken).await.unwrap();
+        assert!(
+            matches!(value, Some(StateStoreDataValue::SyncToken(token)) if token == "sync-token"),
+            "the sync token should survive a close/reopen cycle",
+        );
     }
 }
