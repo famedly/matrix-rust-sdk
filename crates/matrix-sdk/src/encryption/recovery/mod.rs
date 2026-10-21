@@ -496,6 +496,18 @@ impl Recovery {
         Ok(())
     }
 
+    /// Re-determine the [`RecoveryState`] from the homeserver and the local
+    /// secrets, as done once during the E2EE initialization.
+    ///
+    /// The state is otherwise only re-evaluated when the relevant account
+    /// data or secrets change. If the initial check failed, e.g. because the
+    /// client started offline, the state stays [`RecoveryState::Unknown`];
+    /// call this once the homeserver is reachable again.
+    #[instrument(skip_all)]
+    pub async fn refresh_state(&self) -> Result<()> {
+        self.update_recovery_state().await
+    }
+
     /// Recover all the secrets from the homeserver, and, if the key backup
     /// information is inconsistent, create a new key backup.
     ///
