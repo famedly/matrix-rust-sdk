@@ -1654,8 +1654,14 @@ impl EventCacheStoreIntegrationTests for DynEventCacheStore {
         // missing.
         let ThreadInfo { number_of_replies: _, latest_event: _, read_receipts } =
             self.load_thread_info(room_id, thread_id, true).await.unwrap().unwrap();
-        let ReadReceipts { num_unread, num_notifications, num_mentions, latest_active, pending } =
-            read_receipts;
+        let ReadReceipts {
+            num_unread,
+            num_notifications,
+            num_mentions,
+            latest_active,
+            pending,
+            ..
+        } = read_receipts;
         assert_eq!(num_unread, 0);
         assert_eq!(num_notifications, 0);
         assert_eq!(num_mentions, 0);
@@ -1669,8 +1675,14 @@ impl EventCacheStoreIntegrationTests for DynEventCacheStore {
         let mut thread_info =
             self.load_thread_info(room_id, thread_id, false).await.unwrap().unwrap();
         let ThreadInfo { number_of_replies: _, latest_event: _, read_receipts } = &thread_info;
-        let ReadReceipts { num_unread, num_notifications, num_mentions, latest_active, pending } =
-            read_receipts;
+        let ReadReceipts {
+            num_unread,
+            num_notifications,
+            num_mentions,
+            latest_active,
+            pending,
+            ..
+        } = read_receipts;
         assert_eq!(*num_unread, 0);
         assert_eq!(*num_notifications, 0);
         assert_eq!(*num_mentions, 0);
@@ -1687,8 +1699,14 @@ impl EventCacheStoreIntegrationTests for DynEventCacheStore {
         // We must get the updated `ThreadInfo`.
         let ThreadInfo { number_of_replies: _, latest_event: _, read_receipts } =
             self.load_thread_info(room_id, thread_id, true).await.unwrap().unwrap();
-        let ReadReceipts { num_unread, num_notifications, num_mentions, latest_active, pending } =
-            read_receipts;
+        let ReadReceipts {
+            num_unread,
+            num_notifications,
+            num_mentions,
+            latest_active,
+            pending,
+            ..
+        } = read_receipts;
         assert_eq!(num_unread, 1);
         assert_eq!(num_notifications, 2);
         assert_eq!(num_mentions, 0);

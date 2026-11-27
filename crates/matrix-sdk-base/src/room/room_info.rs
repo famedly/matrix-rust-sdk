@@ -1656,6 +1656,7 @@ mod tests {
                     "items": [],
                     "capacity": 10,
                 },
+                "latest_counted": null,
             },
             "recency_stamp": 42,
         });

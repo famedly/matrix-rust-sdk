@@ -62,6 +62,10 @@ pub struct ReadReceipts {
     /// not the event ids of the receipt events themselves.
     #[serde(default = "new_nonempty_ring_buffer")]
     pub pending: RingBuffer<OwnedEventId>,
+
+    /// The latest event included in the counts above.
+    #[serde(default)]
+    pub latest_counted: Option<OwnedEventId>,
 }
 
 impl Default for ReadReceipts {
@@ -72,6 +76,7 @@ impl Default for ReadReceipts {
             num_mentions: Default::default(),
             latest_active: Default::default(),
             pending: new_nonempty_ring_buffer(),
+            latest_counted: None,
         }
     }
 }

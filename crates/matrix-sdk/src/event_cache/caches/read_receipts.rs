@@ -637,6 +637,9 @@ pub(crate) async fn compute_unread_counts<T>(
                 .events()
                 .filter_map(|(_pos, event)| event_filter.filter(event).then_some(event)),
         );
+        read_receipts.latest_counted = linked_chunk
+            .revents()
+            .find_map(|(_pos, event)| event.event_id().map(ToOwned::to_owned));
 
         debug!(?read_receipts, "after finding a better receipt");
         return;
@@ -656,15 +659,25 @@ pub(crate) async fn compute_unread_counts<T>(
     // past, or none.
     //
     // In that case, the number of unreads is _at most_ the number of processed
-    // events. Reset the number of unreads, and recount them all.
-    read_receipts.reset();
+    // events. Reset the number of unreads, and recount them all. Unless the
+    // latest counted event is still loaded (the linked chunk shrank since):
+    // then only count the events after it.
+    let counted = read_receipts.latest_counted.as_deref().and_then(|counted| {
+        linked_chunk.events().position(|(_pos, event)| event.event_id() == Some(counted))
+    });
+    if counted.is_none() {
+        read_receipts.reset();
+    }
 
     for event in linked_chunk
         .events()
+        .skip(counted.map_or(0, |i| i + 1))
         .filter_map(|(_pos, event)| event_filter.filter(event).then_some(event))
     {
         read_receipts.process_event(event, user_id);
     }
+    read_receipts.latest_counted =
+        linked_chunk.revents().find_map(|(_pos, event)| event.event_id().map(ToOwned::to_owned));
 
     debug!(?read_receipts, "no better receipt");
 }
@@ -794,9 +807,12 @@ impl FromIterator<(OwnedEventId, Receipts)> for MaybeReceiptEventContent {
 mod tests {
     use std::{num::NonZeroUsize, ops::Not as _};
 
-    use matrix_sdk_base::{read_receipts::ReadReceipts, store::MemoryStore};
+    use matrix_sdk_base::{
+        read_receipts::{LatestReadReceipt, ReadReceipts},
+        store::MemoryStore,
+    };
     use matrix_sdk_common::{deserialized_responses::TimelineEvent, ring_buffer::RingBuffer};
-    use matrix_sdk_test::{ALICE, event_factory::EventFactory};
+    use matrix_sdk_test::{ALICE, async_test, event_factory::EventFactory};
     use ruma::{
         EventId, MilliSecondsSinceUnixEpoch, RoomId, UserId, event_id,
         events::{
@@ -810,7 +826,8 @@ mod tests {
 
     use super::{
         EventFilter, MaybeReceiptEventContent, ReadReceiptsExt as _, Receipts,
-        RoomReadReceiptEventFilter, marks_as_unread, select_best_receipt, stop_on_event_ids,
+        RoomReadReceiptEventFilter, compute_unread_counts, marks_as_unread, select_best_receipt,
+        stop_on_event_ids,
     };
     use crate::event_cache::caches::{
         event_linked_chunk::EventLinkedChunk, pagination::BackPaginationOutcome,
@@ -1549,6 +1566,52 @@ mod tests {
         assert_eq!(pending_receipts.len(), 2);
         assert!(pending_receipts.iter().any(|ev| ev == event_id!("$6")));
         assert!(pending_receipts.iter().any(|ev| ev == event_id!("$7")));
+    }
+
+    /// Once the receipt's event is no longer loaded (the linked chunk shrank to
+    /// its last chunk), a new event adds to the counts instead of the counts
+    /// dropping to the events still loaded.
+    #[async_test]
+    async fn test_compute_unread_counts_after_shrink() {
+        let room_id = room_id!("!roomid:example.org");
+        let own_user_id = user_id!("@not_alice:example.org");
+        let f = EventFactory::new().room(room_id).sender(*ALICE);
+        let event = |id: &EventId| f.text_msg("A").event_id(id).into_event();
+
+        let state_store = MemoryStore::new();
+        let event_filter = RoomReadReceiptEventFilter {
+            room_id,
+            with_threading_support: false,
+            state_store: &state_store,
+        };
+        let mut receipts = ReadReceipts {
+            latest_active: Some(LatestReadReceipt { event_id: owned_event_id!("$1") }),
+            ..Default::default()
+        };
+
+        // The receipt's event is loaded: 3 unread after it.
+        let mut linked_chunk = EventLinkedChunk::new();
+        linked_chunk.push_events(
+            ["$1", "$2", "$3", "$4"].map(|id| event(<&EventId>::try_from(id).unwrap())),
+        );
+        compute_unread_counts(own_user_id, None, &linked_chunk, &event_filter, &mut receipts, None)
+            .await;
+        assert_eq!(receipts.num_unread, 3);
+
+        // The linked chunk shrank to its last event, and a new one arrives.
+        let mut linked_chunk = EventLinkedChunk::new();
+        linked_chunk.push_events([event(event_id!("$4")), event(event_id!("$5"))]);
+        compute_unread_counts(own_user_id, None, &linked_chunk, &event_filter, &mut receipts, None)
+            .await;
+        assert_eq!(receipts.num_unread, 4);
+
+        // A gap: nothing counted before is loaded, so only the loaded events
+        // can be counted.
+        let mut linked_chunk = EventLinkedChunk::new();
+        linked_chunk.push_events([event(event_id!("$9"))]);
+        compute_unread_counts(own_user_id, None, &linked_chunk, &event_filter, &mut receipts, None)
+            .await;
+        assert_eq!(receipts.num_unread, 1);
     }
 
     #[test]
